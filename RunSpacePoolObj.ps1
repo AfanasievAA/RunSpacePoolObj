@@ -5,9 +5,9 @@
 .DESCRIPTION
   Allows you to easily run, track powershell scriptblocks in parralel with timeout feature and return values
 .NOTES
-  Version:        0.2
+  Version:        0.3
   Author:         Andrew Afanasiev
-  Date:           10.05.2023
+  Date:           23.05.2023
   Purpose/Change: Initial script development
   Contacts:       AfanasievAA@yandex.ru
 
@@ -28,6 +28,7 @@
     State       - Current state of Job
     Arguments   - Current arguments passed to a script
     Information - Return infromation with a script results
+    Errors      - Returns errors encountered during run
 .PARAMETER JobCounter
   CustomObject with counters for current jobs. Updated when called procedure GetCurrentStatus
     Queued      - Number of queued jobs waiting execution
@@ -158,6 +159,7 @@ $Global:RunSpacePoolObj | Add-Member -MemberType ScriptMethod -Name "RunJob" -Va
         State = "Queued"
         Arguments = $ArgumentsArray
         Information = $null
+        Errors = $null
     })
     $this.UpdateJobCounter()
     return ,$JobID
@@ -180,45 +182,61 @@ $Global:RunSpacePoolObj | Add-Member -MemberType ScriptMethod -Name "UpdateJobCo
 
 $Global:RunSpacePoolObj | Add-Member -MemberType ScriptMethod -Name "GetCurrentStatus" -Value {
     $this.JobsCounter.Changed = $false
+    $StartTicksRG = "Start\(Ticks\) = (\d+)"
+    $EndTicksRG = "End\(Ticks\) = (\d+)"
+
     foreach ($Job in $this.Jobs) {
-        if ($Job.pipe.Streams.Error) {
-            $Job.State = "Failed"
-            $Job.Information = $Job.pipe.Streams.Error.Exception
-        } elseif (($Job.Started -eq $null) -and ($Job.Pipe.Streams.Debug[0].Message -match 'Start')) {
-            $StartTicks = $Job.pipe.Streams.Debug[0].Message -replace 'Start\(Ticks\) = (\d+)','$1'
-            $Job.Started = [Datetime]::MinValue + [TimeSpan]::FromTicks($StartTicks)
+        # Marking jobs that are running
+        if (($Job.Started -eq $null) -and ($Job.pipe.Streams.Debug[0].Message -match $StartTicksRG)) {
+            $Job.Started = [Datetime]::MinValue + [TimeSpan]::FromTicks($Matches[1])
             $Job.State = "Running"
-			$this.JobsCounter.Changed = $true
-        } elseif ($Job.Handle.IsCompleted -and $Job.Ended -eq $null) {
-            $EndTicks = $Job.pipe.Streams.Debug[-1].Message -replace 'End\(Ticks\) = (\d+)','$1'
-            $Job.Ended = [Datetime]::MinValue + [TimeSpan]::FromTicks($EndTicks)
+            $this.JobsCounter.Changed = $true
+        }
+        
+        # if completed without errors
+        if ($Job.Handle.IsCompleted -and $null -eq $Job.Ended -and -Not $Job.Pipe.HadErrors) {
+            if ($Job.pipe.Streams.Debug[-1].Message -match $EndTicksRG) {
+                $EndTicks = $Matches[1]    
+                $Job.Ended = [Datetime]::MinValue + [TimeSpan]::FromTicks($EndTicks)
+            } else {
+                $Job.Ended = $Job.Started
+            }
             $Job.State = "Completed"
             $Job.Information = $Job.pipe.Streams.Information
             $Job.Pipe.EndInvoke($Job.Handle)
-            $Job.Pipe.Stop()
             $Job.Pipe.Dispose()
-			$this.JobsCounter.Changed = $true
+            $this.JobsCounter.Changed = $true
         } 
+
         #Job running, exceeded max run time. Record job data and stop thread.
         if ($Job.State -eq 'Running' -and ($Job.Started) -and (-not ($Job.Handle.IsCompleted) ) -and (get-date) -gt ($Job.Started + $this.JobTimeout)) {
             $Job.Ended = (Get-Date)
-            $Job.Pipe.BeginStop($null,$Job.Handle) > $null
+            $null = $Job.Pipe.BeginStop($null,$Job.Handle)
             $Job.State = 'TimedOut'
         } elseif ($Job.State -eq 'Stopping' -and $Job.pipe.InvocationStateInfo.State -eq "Stopped") {
             $Job.Pipe.Dispose()
             $Job.State = 'TimedOut'
 			$this.JobsCounter.Changed = $true
 		}        
-    }
 
-    $this.UpdateJobCounter()
+        # If job finished with errors and there are error stream (not just timed out)
+        if ($Job.Pipe.HadErrors -and $Job.pipe.Streams.Error) {
+            $Job.State = "Failed"
+            $Job.Errors = $Job.pipe.Streams.Error.Exception.Message
+            $Job.Pipe.Dispose()
+            $this.JobsCounter.Changed = $true
+        } 
+
+    }
+    # Updating job counter
+    if ($this.JobsCounter.Changed = $true) {
+        $this.UpdateJobCounter()
+    }
 }
 # Closing runspacepool object after everything is done
 $Global:RunSpacePoolObj | Add-Member -MemberType ScriptMethod -Name "Close" -Value {
     if ($this.RunspacePool -is [System.Object]) {
-        $this.RunspacePool.Close() 
-        $this.RunspacePool.Dispose()
-    } else {
-        $this.RunspacePool = $null
+        $null = $this.RunspacePool.BeginClose($null, $null)
     }
+    $this.RunspacePool = $null
 }
